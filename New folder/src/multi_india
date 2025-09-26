@@ -1,0 +1,72 @@
+"""
+multi_india.py
+Fetch NSE/BSE data, train models for a list of Indian tickers, and save artifacts.
+"""
+
+import os
+from datetime import datetime
+import yfinance as yf
+import pandas as pd
+from sqlalchemy import create_engine
+from features import build_features_for_ticker
+from train import time_train_test_split, prepare_Xy
+from india_config import NSE_TICKERS
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.model_selection import GridSearchCV
+from sklearn.metrics import roc_auc_score
+import joblib
+
+ROOT = os.path.dirname(os.path.dirname(__file__))
+DB_PATH = os.path.join(ROOT, "data", "stocks.db")
+TABLE_NAME = "ohlcv"
+MODEL_DIR = os.path.join(ROOT, "models")
+os.makedirs(MODEL_DIR, exist_ok=True)
+
+def ensure_dirs():
+    os.makedirs(os.path.join(ROOT, "data"), exist_ok=True)
+
+def fetch_to_sql(tickers, start="2015-01-01", end=None, interval="1d"):
+    ensure_dirs()
+    if end is None:
+        end = datetime.today().strftime("%Y-%m-%d")
+    eng = create_engine(f"sqlite:///{DB_PATH}", echo=False)
+    for t in tickers:
+        print(f"Downloading {t} ...")
+        df = yf.download(t, start=start, end=end, interval=interval, progress=False)
+        if df.empty:
+            print(f"[WARN] no data: {t}")
+            continue
+        df.index = pd.to_datetime(df.index)
+        df = df.rename_axis("date").reset_index()
+        df["ticker"] = t
+        df.to_sql(TABLE_NAME, con=eng, if_exists="append", index=False)
+        print(f"Saved {len(df)} rows for {t}")
+
+def train_one(ticker, horizon=1, test_size=0.2):
+    df = build_features_for_ticker(ticker, horizon=horizon)
+    if df.empty or len(df) < 200:
+        raise RuntimeError(f"Not enough data for {ticker}")
+    X_train, y_train = prepare_Xy(df.iloc[:int(len(df)*(1-test_size))])
+    X_test,  y_test  = prepare_Xy(df.iloc[int(len(df)*(1-test_size)):])
+
+    rf = RandomForestClassifier(n_jobs=-1, random_state=42)
+    params = {"n_estimators":[200,350], "max_depth":[8,12,None]}
+    gs = GridSearchCV(rf, params, cv=3, scoring="roc_auc", n_jobs=-1)
+    gs.fit(X_train, y_train)
+    best = gs.best_estimator_
+    auc = roc_auc_score(y_test, best.predict_proba(X_test)[:,1])
+
+    art = {"model": best, "features": list(X_train.columns), "ticker": ticker, "horizon": horizon}
+    joblib.dump(art, os.path.join(MODEL_DIR, f"{ticker}_rf_model.joblib"))
+    print(f"{ticker}: AUC={auc:.3f}  (saved model)")
+
+def main():
+    fetch_to_sql(NSE_TICKERS, start="2015-01-01")
+    for t in NSE_TICKERS:
+        try:
+            train_one(t)
+        except Exception as e:
+            print(f"[WARN] {t}: {e}")
+
+if __name__ == "__main__":
+    main()
